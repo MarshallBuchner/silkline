@@ -1,0 +1,259 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>body{margin:0}</style></head><body>
+<title>Window Mode</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Oxanium:wght@500;700&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<style>
+/* Full-bleed WebGL window; HUD pinned top and bottom; tiny camera preview top-right. Single dark look by design. */
+:root{
+  --bg:#05070d; --fg:#e6edf5; --muted:#8f9cb0; --accent:#5ee0ff; --panel:rgba(8,12,20,.78); --line:rgba(94,224,255,.22);
+  --display:"Oxanium",ui-monospace,Menlo,monospace; --body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  color-scheme:dark;
+}
+html,body{height:100%}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
+#gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+video{position:fixed;top:calc(52px + env(safe-area-inset-top,0px));right:16px;width:64px;height:86px;object-fit:cover;border-radius:10px;border:1px solid var(--line);transform:scaleX(-1);opacity:.85}
+.hud{position:fixed;left:16px;right:16px;display:flex;justify-content:space-between;align-items:flex-end;gap:12px;pointer-events:none}
+.top{top:calc(16px + env(safe-area-inset-top,0px));align-items:center}
+.bottom{bottom:calc(16px + env(safe-area-inset-bottom,0px));flex-wrap:wrap}
+.brand{font-family:var(--display);font-weight:700;letter-spacing:.32em;font-size:13px}
+.status{font-family:var(--display);font-size:12px;letter-spacing:.12em;color:var(--muted);text-transform:uppercase;display:flex;align-items:center;gap:8px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.dot.live{background:var(--accent);box-shadow:0 0 10px var(--accent)}
+.panel{pointer-events:auto;background:var(--panel);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-size:13px;line-height:1.5;color:var(--muted);max-width:44ch;min-width:0}
+.panel b{color:var(--fg);font-weight:500}
+.actions{display:flex;gap:8px;pointer-events:auto;flex-wrap:wrap}
+button{font-family:var(--display);font-weight:500;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--bg);background:var(--accent);border:0;border-radius:8px;padding:10px 14px;cursor:pointer}
+button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)}
+button:focus-visible{outline:2px solid var(--fg);outline-offset:2px}
+button:disabled{opacity:.5;cursor:default}
+</style>
+
+<canvas id="gl" aria-label="3D window. Move your head, or drag, to look around inside."></canvas>
+<video id="cam" playsinline muted hidden></video>
+
+<div class="hud top">
+  <div class="brand">WINDOW</div>
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">Drag to look</span></div>
+</div>
+<div class="hud bottom">
+  <div class="panel" id="msg"><b>Your screen is a window into a room behind it.</b> Start the camera, hold the phone at arm’s length and move your head side to side. Drag with a finger to look around without the camera.</div>
+  <div class="actions">
+    <button id="camBtn">Start camera</button>
+    <button id="depthBtn" class="ghost">Depth: high</button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+  const canvas = document.getElementById('gl');
+  const video = document.getElementById('cam');
+  const msg = document.getElementById('msg'), dot = document.getElementById('dot'), statusText = document.getElementById('statusText');
+  const camBtn = document.getElementById('camBtn'), depthBtn = document.getElementById('depthBtn');
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // World units are centimetres. The phone screen is the plane z = 0; the room sits behind it.
+  const SCREEN_H = 15;          // roughly a phone held upright
+  const ROOM_D = 60;            // how deep the room goes behind the glass
+  let W = innerWidth, H = innerHeight, SCREEN_W = SCREEN_H * W / H;
+
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  renderer.setClearColor(0x05070d, 1);
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(0x05070d, 40, 110);
+  const camera = new THREE.PerspectiveCamera(50, W / H, 1, 400);
+
+  scene.add(new THREE.HemisphereLight(0xbfe9ff, 0x101624, 0.75));
+  const key = new THREE.DirectionalLight(0xffffff, 0.9); key.position.set(10, 20, 30); scene.add(key);
+  const glow = new THREE.PointLight(0x5ee0ff, 1.4, 70); glow.position.set(0, 0, -18); scene.add(glow);
+
+  // ----- the room: grid-lined box behind the glass -----
+  let room = null;
+  function buildRoom() {
+    if (room) { scene.remove(room); room.traverse(o => o.geometry && o.geometry.dispose()); }
+    room = new THREE.Group();
+    const hw = SCREEN_W / 2, hh = SCREEN_H / 2, step = 2.5, pts = [];
+    const L = (a, b) => pts.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+    for (let z = 0; z >= -ROOM_D; z -= step * 2) {          // depth rings
+      L([-hw, -hh, z], [hw, -hh, z]); L([-hw, hh, z], [hw, hh, z]);
+      L([-hw, -hh, z], [-hw, hh, z]); L([hw, -hh, z], [hw, hh, z]);
+    }
+    for (let x = -hw; x <= hw + 0.01; x += step) { L([x, -hh, 0], [x, -hh, -ROOM_D]); L([x, hh, 0], [x, hh, -ROOM_D]); L([x, -hh, -ROOM_D], [x, hh, -ROOM_D]); }
+    for (let y = -hh; y <= hh + 0.01; y += step) { L([-hw, y, 0], [-hw, y, -ROOM_D]); L([hw, y, 0], [hw, y, -ROOM_D]); L([-hw, y, -ROOM_D], [hw, y, -ROOM_D]); }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    room.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x5ee0ff, transparent: true, opacity: 0.35 })));
+    scene.add(room);
+    placeTargets();
+  }
+
+  // ----- a machined gear floating mid-room -----
+  function gearShape(teeth, rOut, rRoot) {
+    const s = new THREE.Shape(), n = teeth * 4;
+    for (let i = 0; i <= n; i++) {
+      const a = (i / n) * Math.PI * 2, phase = i % 4, r = (phase === 1 || phase === 2) ? rOut : rRoot;
+      const x = Math.cos(a) * r, y = Math.sin(a) * r;
+      i === 0 ? s.moveTo(x, y) : s.lineTo(x, y);
+    }
+    const hole = new THREE.Path(); hole.absarc(0, 0, rRoot * 0.32, 0, Math.PI * 2, true); s.holes.push(hole);
+    return s;
+  }
+  const metal = new THREE.MeshStandardMaterial({ color: 0xc9d3dd, metalness: 0.55, roughness: 0.3 });
+  const gearGeo = new THREE.ExtrudeGeometry(gearShape(20, 3.6, 3.05), { depth: 1.2, bevelEnabled: true, bevelSize: 0.08, bevelThickness: 0.08, bevelSegments: 1, curveSegments: 4 });
+  gearGeo.center();
+  const gear = new THREE.Mesh(gearGeo, metal); gear.position.set(0, 0.5, -16); scene.add(gear);
+
+  const small = new THREE.Mesh(new THREE.ExtrudeGeometry(gearShape(12, 2.1, 1.75), { depth: 1, bevelEnabled: false, curveSegments: 4 }).center(), metal);
+  small.position.set(4.1, -2.2, -13); scene.add(small);
+
+  // ----- targets on stands at different depths; the front ones pop out of the glass -----
+  const targets = new THREE.Group(); scene.add(targets);
+  const ringMat = new THREE.MeshStandardMaterial({ color: 0xff7a45, metalness: 0.2, roughness: 0.5, emissive: 0x401505 });
+  const whiteMat = new THREE.MeshStandardMaterial({ color: 0xeef3f8, metalness: 0.1, roughness: 0.6 });
+  const stemMat = new THREE.LineBasicMaterial({ color: 0xeef3f8, transparent: true, opacity: 0.5 });
+  function placeTargets() {
+    while (targets.children.length) { const c = targets.children.pop(); c.geometry && c.geometry.dispose(); }
+    const hw = SCREEN_W / 2, hh = SCREEN_H / 2;
+    const spots = [[-0.55, 0.45, 7], [0.5, -0.5, 4], [-0.4, -0.35, -6], [0.55, 0.3, -28], [-0.3, 0.1, -44], [0.15, -0.2, -55]];
+    for (const [fx, fy, z] of spots) {
+      const x = fx * hw * 1.4, y = fy * hh * 1.2, r = 0.9;
+      const outer = new THREE.Mesh(new THREE.CylinderGeometry(r, r, 0.25, 32), ringMat);
+      const inner = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.6, r * 0.6, 0.27, 32), whiteMat);
+      const bull = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.25, r * 0.25, 0.29, 24), ringMat);
+      for (const m of [outer, inner, bull]) { m.rotation.x = Math.PI / 2; m.position.set(x, y, z); targets.add(m); }
+      const sg = new THREE.BufferGeometry(); sg.setAttribute('position', new THREE.Float32BufferAttribute([x, y, z - 0.15, x, y, -ROOM_D], 3));
+      targets.add(new THREE.LineSegments(sg, stemMat));
+    }
+  }
+
+  // ----- drifting hex nuts -----
+  const nutGeo = new THREE.CylinderGeometry(0.55, 0.55, 0.45, 6);
+  const nuts = [];
+  for (let i = 0; i < 22; i++) {
+    const m = new THREE.Mesh(nutGeo, metal);
+    m.userData = { sx: Math.random() * 2 - 1, sy: Math.random() * 2 - 1, z: -2 - Math.random() * 50, sp: 0.2 + Math.random() * 0.5, ph: Math.random() * 6.28, rx: Math.random(), ry: Math.random() };
+    scene.add(m); nuts.push(m);
+  }
+
+  // ----- head position -> off-axis camera (the window effect) -----
+  const head = { x: 0, y: 0, z: 38 }, goal = { x: 0, y: 0, z: 38 };
+  let gain = 1.35;
+  function applyCamera() {
+    const n = 1, hz = Math.max(12, head.z);
+    const l = (-SCREEN_W / 2 - head.x) * n / hz, r = (SCREEN_W / 2 - head.x) * n / hz;
+    const b = (-SCREEN_H / 2 - head.y) * n / hz, t = (SCREEN_H / 2 - head.y) * n / hz;
+    camera.position.set(head.x, head.y, hz);
+    camera.rotation.set(0, 0, 0);
+    camera.updateMatrixWorld();
+    camera.projectionMatrix.makePerspective(l, r, t, b, n, 400);
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+  }
+
+  function resize() {
+    W = innerWidth; H = innerHeight; SCREEN_W = SCREEN_H * W / H;
+    renderer.setSize(W, H, false); buildRoom();
+  }
+  addEventListener('resize', resize); resize();
+
+  // ----- drag fallback: your finger stands in for your head -----
+  let drag = null, lastInput = 0;
+  canvas.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY, gx: goal.x, gy: goal.y }; lastInput = performance.now(); });
+  addEventListener('pointermove', e => {
+    if (!drag || tracking) return;
+    goal.x = drag.gx - (e.clientX - drag.x) / W * 30;
+    goal.y = drag.gy + (e.clientY - drag.y) / H * 40;
+    goal.x = Math.max(-25, Math.min(25, goal.x)); goal.y = Math.max(-30, Math.min(30, goal.y));
+    lastInput = performance.now();
+  });
+  addEventListener('pointerup', () => { drag = null; });
+  addEventListener('pointercancel', () => { drag = null; });
+
+  depthBtn.addEventListener('click', () => {
+    gain = gain > 1.2 ? 1.0 : gain > 0.9 ? 0.7 : 1.35;
+    depthBtn.textContent = 'Depth: ' + (gain > 1.2 ? 'high' : gain > 0.9 ? 'normal' : 'low');
+  });
+
+  // ----- face tracking -----
+  let tracking = false, detector = null, lastVideoTime = -1, lostAt = 0;
+  const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+  function setStatus(t, live) { statusText.textContent = t; dot.classList.toggle('live', !!live); }
+
+  camBtn.addEventListener('click', async () => {
+    if (tracking) return;
+    camBtn.disabled = true; setStatus('Starting camera');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+      video.srcObject = stream; video.hidden = false; await video.play();
+    } catch (e) {
+      camBtn.disabled = false; setStatus('Drag to look');
+      msg.innerHTML = '<b>The camera is blocked here.</b> Open this page from its github.io link and allow camera access. Dragging still works.';
+      return;
+    }
+    setStatus('Loading face model');
+    try {
+      const vision = await import(MP + '/vision_bundle.mjs');
+      const fs = await vision.FilesetResolver.forVisionTasks(MP + '/wasm');
+      const opts = d => ({ baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite', delegate: d }, runningMode: 'VIDEO', minDetectionConfidence: 0.5 });
+      try { detector = await vision.FaceDetector.createFromOptions(fs, opts('GPU')); }
+      catch (g) { detector = await vision.FaceDetector.createFromOptions(fs, opts('CPU')); }
+    } catch (e) {
+      camBtn.disabled = false; setStatus('Drag to look');
+      msg.innerHTML = '<b>The face model couldn’t load.</b> Check your connection and reload. Dragging still works.';
+      return;
+    }
+    tracking = true; camBtn.textContent = 'Tracking'; setStatus('Tracking', true);
+    msg.innerHTML = '<b>Hold the phone at arm’s length</b> and move your head slowly left, right, up and down. Lean in to get closer to the glass.';
+  });
+
+  function detect(now) {
+    if (!detector || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+    lastVideoTime = video.currentTime;
+    let res; try { res = detector.detectForVideo(video, now); } catch (e) { return; }
+    const d = res.detections && res.detections[0];
+    if (!d || !d.keypoints || d.keypoints.length < 2) {
+      if (now - lostAt > 600) { setStatus('Looking for you'); dot.classList.remove('live'); }
+      return;
+    }
+    lostAt = now; setStatus('Tracking', true);
+    const vw = video.videoWidth || 640, vh = video.videoHeight || 480, big = Math.max(vw, vh);
+    const e1 = d.keypoints[0], e2 = d.keypoints[1];
+    const ex = (e1.x + e2.x) / 2, ey = (e1.y + e2.y) / 2;
+    const eyeSpan = Math.hypot((e1.x - e2.x) * vw, (e1.y - e2.y) * vh) / big;   // fraction of the frame's long side
+    const FOV = 1.15;                                                             // frame long side ≈ 1.15 × distance
+    const z = Math.max(18, Math.min(80, 6.3 / (FOV * Math.max(eyeSpan, 0.02))));
+    const span = z * FOV;
+    goal.z = z;
+    goal.x = (0.5 - ex) * span * (vw / big) * gain;      // camera image is un-mirrored, so flip x
+    goal.y = (0.5 - ey) * span * (vh / big) * gain;
+  }
+
+  // ----- loop -----
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    const t = now / 1000;
+    if (tracking) detect(now);
+    else if (!drag && now - lastInput > 2500 && !reduce) {      // idle sway so the depth reads before anyone touches it
+      goal.x = Math.sin(t * 0.6) * 9; goal.y = Math.sin(t * 0.43) * 6; goal.z = 38;
+    }
+    const k = 1 - Math.pow(tracking ? 0.0008 : 0.02, dt);       // smoothing
+    head.x += (goal.x - head.x) * k; head.y += (goal.y - head.y) * k; head.z += (goal.z - head.z) * k;
+
+    const spin = reduce ? 0.15 : 0.5;
+    gear.rotation.z = t * spin; gear.rotation.y = Math.sin(t * 0.4) * 0.35;
+    small.rotation.z = -t * spin * (20 / 12) + 0.13; small.rotation.y = gear.rotation.y;
+    const hw = SCREEN_W / 2, hh = SCREEN_H / 2;
+    for (const m of nuts) {
+      const u = m.userData;
+      m.position.set(u.sx * hw * 0.9 + Math.sin(t * u.sp + u.ph) * 1.2, u.sy * hh * 0.9 + Math.cos(t * u.sp * 0.8 + u.ph) * 1.2, u.z);
+      m.rotation.x = t * u.rx; m.rotation.y = t * u.ry;
+    }
+    applyCamera();
+    renderer.render(scene, camera);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+
+</body></html>
